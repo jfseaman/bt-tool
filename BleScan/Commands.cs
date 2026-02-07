@@ -44,19 +44,30 @@ public sealed class RootCommandHandler : ICommandHandler
 
     public async ValueTask ExecuteAsync(CommandContext context)
     {
-        // Apply default RSSI value if not specified
-        var rssiThreshold = Rssi ?? -90;
+        // Capture original console color for restoration
+        var originalColor = Console.ForegroundColor;
 
-        // Validate RSSI range
-        if (rssiThreshold is < -127 or > 20)
+        try
         {
-            ConsoleWriteLine(ConsoleColor.Red, $"Error: RSSI value must be between -127 and +20. Provided value: {rssiThreshold}");
-            return;
-        }
+            // Set up Ctrl+C handler to restore color on interruption
+            Console.CancelKeyPress += (sender, e) =>
+            {
+                Console.ForegroundColor = originalColor;
+            };
 
-        var set = new HashSet<ulong>();
-        using var outputLock = new SemaphoreSlim(1, 1);
-        var deviceFound = false;
+            // Apply default RSSI value if not specified
+            var rssiThreshold = Rssi ?? -90;
+
+            // Validate RSSI range
+            if (rssiThreshold is < -127 or > 20)
+            {
+                ConsoleWriteLine(ConsoleColor.Red, $"Error: RSSI value must be between -127 and +20. Provided value: {rssiThreshold}");
+                return;
+            }
+
+            var set = new HashSet<ulong>();
+            using var outputLock = new SemaphoreSlim(1, 1);
+            var deviceFound = false;
 
         var watcher = new BluetoothLEAdvertisementWatcher
         {
@@ -251,6 +262,12 @@ public sealed class RootCommandHandler : ICommandHandler
         Console.ReadLine();
         watcher.Stop();
     }
+        }
+        finally
+        {
+            // Always restore the original console color
+            Console.ForegroundColor = originalColor;
+        }
 }
 
     private static void ConsoleWrite(ConsoleColor color, string value)
