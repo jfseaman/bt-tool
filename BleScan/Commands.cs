@@ -36,10 +36,27 @@ public sealed class RootCommandHandler : ICommandHandler
     [Option("--section", "-s", Description = "Show data section")]
     public bool Section { get; set; }
 
+    [Option("--rssi", "-r", Description = "Minimum RSSI threshold (dBm, range: -127 to +20)")]
+    public short? Rssi { get; set; }
+
+    [Option("--name", "-n", Description = "Filter by device name")]
+    public string? Name { get; set; }
+
     public async ValueTask ExecuteAsync(CommandContext context)
     {
+        // Apply default RSSI value if not specified
+        var rssiThreshold = Rssi ?? -90;
+
+        // Validate RSSI range
+        if (rssiThreshold is < -127 or > 20)
+        {
+            ConsoleWriteLine(ConsoleColor.Red, $"Error: RSSI value must be between -127 and +20. Provided value: {rssiThreshold}");
+            return;
+        }
+
         var set = new HashSet<ulong>();
         using var outputLock = new SemaphoreSlim(1, 1);
+        var deviceFound = false;
 
         var watcher = new BluetoothLEAdvertisementWatcher
         {
@@ -52,6 +69,12 @@ public sealed class RootCommandHandler : ICommandHandler
         // ReSharper disable once AsyncVoidMethod
         async void WatcherOnReceived(BluetoothLEAdvertisementWatcher sender, BluetoothLEAdvertisementReceivedEventArgs args)
         {
+            // Filter by RSSI threshold
+            if (args.RawSignalStrengthInDBm < rssiThreshold)
+            {
+                return;
+            }
+
             if (Once)
             {
                 lock (set)
@@ -95,6 +118,18 @@ public sealed class RootCommandHandler : ICommandHandler
                     delayMs: 200)
                 : null;
             var name = device.Name ?? "(Unknown)";
+
+            // Filter by device name if specified
+            if (!string.IsNullOrEmpty(Name) && !name.Equals(Name, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            // Mark that we found a matching device
+            if (!string.IsNullOrEmpty(Name))
+            {
+                deviceFound = true;
+            }
 
             await outputLock.WaitAsync();
             using var _ = new SemaphoreReleaser(outputLock);
@@ -200,7 +235,15 @@ public sealed class RootCommandHandler : ICommandHandler
         // Scan for 10 seconds, then stop automatically
         await Task.Delay(TimeSpan.FromSeconds(10));
         watcher.Stop();
-        Console.WriteLine("\nScan complete.");
+        
+        if (!string.IsNullOrEmpty(Name) && !deviceFound)
+        {
+            ConsoleWriteLine(ConsoleColor.Red, $"Device [{Name}] not found.");
+        }
+        else
+        {
+            Console.WriteLine("\nScan complete.");
+        }
     }
     else
     {
