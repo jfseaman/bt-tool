@@ -4,6 +4,8 @@ using Windows.Devices.Bluetooth.GenericAttributeProfile;
 
 internal static class DisplayHelper
 {
+    private static readonly Guid BluetoothBaseUuid = new("00000000-0000-1000-8000-00805F9B34FB");
+
     public static string GetServiceName(GattDeviceService service)
     {
         if (IsSigDefinedUuid(service.Uuid))
