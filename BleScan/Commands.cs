@@ -55,6 +55,14 @@ public sealed class RootCommandHandler : ICommandHandler
                 Console.ForegroundColor = originalColor;
             };
 
+            // Echo command line arguments
+            var args = Environment.GetCommandLineArgs();
+            if (args.Length > 0)
+            {
+                //ConsoleWrite(ConsoleColor.DarkGray, "Args: ");
+                Console.WriteLine(string.Join(" ", args));
+            }
+
             // Apply default RSSI value if not specified
             var rssiThreshold = Rssi ?? -90;
 
@@ -107,7 +115,7 @@ public sealed class RootCommandHandler : ICommandHandler
                         break;
                     }
 
-                    await Task.Delay(5000);
+                    await Task.Delay(10000);
                 }
                 if (device is null)
                 {
