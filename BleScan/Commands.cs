@@ -68,207 +68,224 @@ public sealed class RootCommandHandler : ICommandHandler
             var set = new HashSet<ulong>();
             using var outputLock = new SemaphoreSlim(1, 1);
             var deviceFound = false;
+            var completionSource = new TaskCompletionSource<bool>();
 
-        var watcher = new BluetoothLEAdvertisementWatcher
-        {
-            ScanningMode = Active ? BluetoothLEScanningMode.Active : BluetoothLEScanningMode.Passive
-        };
+            var watcher = new BluetoothLEAdvertisementWatcher
+            {
+                ScanningMode = Active ? BluetoothLEScanningMode.Active : BluetoothLEScanningMode.Passive
+            };
 
-        watcher.Received += WatcherOnReceived;
+            watcher.Received += WatcherOnReceived;
 
 #pragma warning disable CA1031
-        // ReSharper disable once AsyncVoidMethod
-        async void WatcherOnReceived(BluetoothLEAdvertisementWatcher sender, BluetoothLEAdvertisementReceivedEventArgs args)
-        {
-            // Filter by RSSI threshold
-            if (args.RawSignalStrengthInDBm < rssiThreshold)
+            // ReSharper disable once AsyncVoidMethod
+            async void WatcherOnReceived(BluetoothLEAdvertisementWatcher sender, BluetoothLEAdvertisementReceivedEventArgs args)
             {
-                return;
-            }
-
-            if (Once)
-            {
-                lock (set)
+                // Filter by RSSI threshold
+                if (args.RawSignalStrengthInDBm < rssiThreshold)
                 {
-                    if (!set.Add(args.BluetoothAddress))
+                    return;
+                }
+
+                if (Once)
+                {
+                    lock (set)
                     {
-                        return;
+                        if (!set.Add(args.BluetoothAddress))
+                        {
+                            return;
+                        }
                     }
                 }
-            }
 
-            BluetoothLEDevice? device = null;
-            for (var attempt = 0; attempt < 5; attempt++)
-            {
-                device = await BluetoothLEDevice.FromBluetoothAddressAsync(args.BluetoothAddress);
-                if (device is not null)
+                BluetoothLEDevice? device = null;
+                for (var attempt = 0; attempt < 5; attempt++)
                 {
-                    break;
+                    device = await BluetoothLEDevice.FromBluetoothAddressAsync(args.BluetoothAddress);
+                    if (device is not null)
+                    {
+                        break;
+                    }
+
+                    await Task.Delay(5000);
+                }
+                if (device is null)
+                {
+                    ConsoleWriteLine(ConsoleColor.Red, "(Bluetooth device not found)");
+                    return;
                 }
 
-                await Task.Delay(10000);
-            }
-            if (device is null)
-            {
-                ConsoleWriteLine(ConsoleColor.Red, "(Bluetooth device not found)");
-                return;
-            }
+                var session = await GattSession.FromDeviceIdAsync(device.BluetoothDeviceId);
+                if (session is not null)
+                {
+                    session.MaintainConnection = true;
+                }
 
-            var session = await GattSession.FromDeviceIdAsync(device.BluetoothDeviceId);
-            if (session is not null)
-            {
-                session.MaintainConnection = true;
+                var cancellationToken = CancellationToken.None;
+                var services = Gatt
+                    ? await RetryAsync(
+                        () => device.GetGattServicesAsync(BluetoothCacheMode.Uncached).AsTask(cancellationToken),
+                        attempts: 5,
+                        delayMs: 200,
+                        cancellationToken)
+                    : null;
+                var name = device.Name ?? "(Unknown)";
+
+                // Filter by device name if specified
+                if (!string.IsNullOrEmpty(Name) && !name.Equals(Name, StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+
+                // Mark that we found a matching device
+                if (!string.IsNullOrEmpty(Name))
+                {
+                    deviceFound = true;
+                }
+
+                await outputLock.WaitAsync();
+                using var releaser = new SemaphoreReleaser(outputLock);
+
+                ConsoleWrite(ConsoleColor.Cyan, $"{args.Timestamp:HH:mm:ss.fff}");
+                ConsoleWrite(Console.ForegroundColor, " [");
+                ConsoleWrite(ConsoleColor.DarkCyan, ToAddressString(args.BluetoothAddress));
+                ConsoleWrite(Console.ForegroundColor, "] ");
+                ConsoleWrite(ConsoleColor.Yellow, "RSSI:");
+                ConsoleWrite(Console.ForegroundColor, $"{args.RawSignalStrengthInDBm}");
+                ConsoleWrite(Console.ForegroundColor, " ");
+                ConsoleWriteLine(ConsoleColor.Magenta, name);
+
+                if (Info && (device is not null))
+                {
+                    ConsoleWrite(ConsoleColor.Yellow, "DeviceId:");
+                    ConsoleWriteLine(Console.ForegroundColor, $" {device.BluetoothDeviceId.Id}");
+                    ConsoleWrite(ConsoleColor.Yellow, "AddressType:");
+                    ConsoleWriteLine(Console.ForegroundColor, $" {device.BluetoothAddressType}");
+                    ConsoleWrite(ConsoleColor.Yellow, "ConnectionStatus:");
+                    ConsoleWriteLine(Console.ForegroundColor, $" {device.ConnectionStatus}");
+                    ConsoleWrite(ConsoleColor.Yellow, "ProtectionLevel:");
+                    ConsoleWriteLine(Console.ForegroundColor, $" {device.DeviceInformation.Pairing.ProtectionLevel}");
+                    ConsoleWrite(ConsoleColor.Yellow, "IsPaired:");
+                    ConsoleWriteLine(Console.ForegroundColor, $" {device.DeviceInformation.Pairing.IsPaired}");
+                    ConsoleWrite(ConsoleColor.Yellow, "CanPair:");
+                    ConsoleWriteLine(Console.ForegroundColor, $" {device.DeviceInformation.Pairing.CanPair}");
+                }
+
+                if (Gatt && (services is not null))
+                {
+                    if (services.Status == GattCommunicationStatus.Success)
+                    {
+                        ConsoleWriteLine(ConsoleColor.Yellow, "GattServices:");
+                        foreach (var service in services.Services)
+                        {
+                            ConsoleWrite(Console.ForegroundColor, $"  {service.Uuid}    ");
+                            ConsoleWriteLine(ConsoleColor.Blue, DisplayHelper.GetServiceName(service));
+                            var characteristics = await RetryAsync(
+                            () => service.GetCharacteristicsAsync(BluetoothCacheMode.Uncached).AsTask(cancellationToken),
+                            attempts: 3,
+                            delayMs: 150,
+                            cancellationToken);
+
+                            if (characteristics.Status != GattCommunicationStatus.Success)
+                            {
+                                continue;
+                            }
+
+                            foreach (var characteristic in characteristics.Characteristics)
+                            {
+                                ConsoleWrite(Console.ForegroundColor, $"    {characteristic.Uuid}    ");
+                                ConsoleWrite(ConsoleColor.Blue, DisplayHelper.GetCharacteristicName(characteristic));
+                                ConsoleWrite(Console.ForegroundColor, " [");
+                                ConsoleWrite(ConsoleColor.Green, characteristic.CharacteristicProperties.ToString());
+                                ConsoleWriteLine(Console.ForegroundColor, "]");
+                            }
+                        }
+                    }
+                    else
+                    {
+                        ConsoleWrite(ConsoleColor.Yellow, "GattServices:");
+                        ConsoleWriteLine(ConsoleColor.Red, $" {services.Status}");
+                    }
+                }
+
+                if (Manufacturer)
+                {
+                    foreach (var md in args.Advertisement.ManufacturerData)
+                    {
+                        ConsoleWrite(ConsoleColor.Yellow, "CompanyId:");
+                        ConsoleWriteLine(Console.ForegroundColor, $" 0x{md.CompanyId:X4}");
+                        ConsoleWriteLine(ConsoleColor.Yellow, "Data:");
+                        var array = md.Data.ToArray().AsSpan();
+                        for (var start = 0; start < array.Length; start += 16)
+                        {
+                            ConsoleWriteLine(ConsoleColor.DarkGreen, ToHexString(array.Slice(start, Math.Min(16, array.Length - start))));
+                        }
+                    }
+                }
+
+                if (Section)
+                {
+                    foreach (var ds in args.Advertisement.DataSections)
+                    {
+                        ConsoleWrite(ConsoleColor.Yellow, "DataType:");
+                        ConsoleWriteLine(Console.ForegroundColor, $" 0x{ds.DataType:X2}");
+                        ConsoleWriteLine(ConsoleColor.Yellow, "Data:");
+                        var array = ds.Data.ToArray().AsSpan();
+                        for (var start = 0; start < array.Length; start += 16)
+                        {
+                            ConsoleWriteLine(ConsoleColor.DarkGreen, ToHexString(array.Slice(start, Math.Min(16, array.Length - start))));
+                        }
+                    }
+                }
+
+                // Signal completion after all information is displayed (when -n is specified)
+                if (!string.IsNullOrEmpty(Name) && deviceFound)
+                {
+                    completionSource.TrySetResult(true);
+                }
             }
+#pragma warning restore CA1031
 
-            var cancellationToken = CancellationToken.None;
-            var services = Gatt
-                ? await RetryAsync(
-                    () => device.GetGattServicesAsync(BluetoothCacheMode.Uncached).AsTask(cancellationToken),
-                    cancellationToken,
-                    attempts: 5,
-                    delayMs: 200)
-                : null;
-            var name = device.Name ?? "(Unknown)";
+            watcher.Start();
 
-            // Filter by device name if specified
-            if (!string.IsNullOrEmpty(Name) && !name.Equals(Name, StringComparison.OrdinalIgnoreCase))
-            {
-                return;
-            }
-
-            // Mark that we found a matching device
             if (!string.IsNullOrEmpty(Name))
             {
-                deviceFound = true;
-            }
+                // When searching for a specific device, wait for it to be found or timeout
+                var completedTask = await Task.WhenAny(
+                    completionSource.Task,
+                    Task.Delay(TimeSpan.FromSeconds(30)));
 
-            await outputLock.WaitAsync();
-            using var _ = new SemaphoreReleaser(outputLock);
+                watcher.Stop();
 
-            ConsoleWrite(ConsoleColor.Cyan, $"{args.Timestamp:HH:mm:ss.fff}");
-            ConsoleWrite(Console.ForegroundColor, " [");
-            ConsoleWrite(ConsoleColor.DarkCyan, ToAddressString(args.BluetoothAddress));
-            ConsoleWrite(Console.ForegroundColor, "] ");
-            ConsoleWrite(ConsoleColor.Yellow, "RSSI:");
-            ConsoleWrite(Console.ForegroundColor, $"{args.RawSignalStrengthInDBm}");
-            ConsoleWrite(Console.ForegroundColor, " ");
-            ConsoleWriteLine(ConsoleColor.Magenta, name);
-
-            if (Info && (device is not null))
-            {
-                ConsoleWrite(ConsoleColor.Yellow, "DeviceId:");
-                ConsoleWriteLine(Console.ForegroundColor, $" {device.BluetoothDeviceId.Id}");
-                ConsoleWrite(ConsoleColor.Yellow, "AddressType:");
-                ConsoleWriteLine(Console.ForegroundColor, $" {device.BluetoothAddressType}");
-                ConsoleWrite(ConsoleColor.Yellow, "ConnectionStatus:");
-                ConsoleWriteLine(Console.ForegroundColor, $" {device.ConnectionStatus}");
-                ConsoleWrite(ConsoleColor.Yellow, "ProtectionLevel:");
-                ConsoleWriteLine(Console.ForegroundColor, $" {device.DeviceInformation.Pairing.ProtectionLevel}");
-                ConsoleWrite(ConsoleColor.Yellow, "IsPaired:");
-                ConsoleWriteLine(Console.ForegroundColor, $" {device.DeviceInformation.Pairing.IsPaired}");
-                ConsoleWrite(ConsoleColor.Yellow, "CanPair:");
-                ConsoleWriteLine(Console.ForegroundColor, $" {device.DeviceInformation.Pairing.CanPair}");
-            }
-
-            if (Gatt && (services is not null))
-            {
-                if (services.Status == GattCommunicationStatus.Success)
+                if (completedTask == completionSource.Task)
                 {
-                    ConsoleWriteLine(ConsoleColor.Yellow, "GattServices:");
-                    foreach (var service in services.Services)
-                    {
-                        ConsoleWrite(Console.ForegroundColor, $"  {service.Uuid}    ");
-                        ConsoleWriteLine(ConsoleColor.Blue, DisplayHelper.GetServiceName(service));
-                        var characteristics = await RetryAsync(
-                            () => service.GetCharacteristicsAsync(BluetoothCacheMode.Uncached).AsTask(cancellationToken),
-                            cancellationToken,
-                            attempts: 3,
-                            delayMs: 150);
-
-                        if (characteristics.Status != GattCommunicationStatus.Success)
-                        {
-                            continue;
-                        }
-
-                        foreach (var characteristic in characteristics.Characteristics)
-                        {
-                            ConsoleWrite(Console.ForegroundColor, $"    {characteristic.Uuid}    ");
-                            ConsoleWrite(ConsoleColor.Blue, DisplayHelper.GetCharacteristicName(characteristic));
-                            ConsoleWrite(Console.ForegroundColor, " [");
-                            ConsoleWrite(ConsoleColor.Green, characteristic.CharacteristicProperties.ToString());
-                            ConsoleWriteLine(Console.ForegroundColor, "]");
-                        }
-                    }
+                    Console.WriteLine("\nDevice found.");
                 }
                 else
                 {
-                    ConsoleWrite(ConsoleColor.Yellow, "GattServices:");
-                    ConsoleWriteLine(ConsoleColor.Red, $" {services.Status}");
+                    ConsoleWriteLine(ConsoleColor.Red, $"Device [{Name}] not found within timeout.");
                 }
             }
-
-            if (Manufacturer)
+            else if (Once)
             {
-                foreach (var md in args.Advertisement.ManufacturerData)
-                {
-                    ConsoleWrite(ConsoleColor.Yellow, "CompanyId:");
-                    ConsoleWriteLine(Console.ForegroundColor, $" 0x{md.CompanyId:X4}");
-                    ConsoleWriteLine(ConsoleColor.Yellow, "Data:");
-                    var array = md.Data.ToArray().AsSpan();
-                    for (var start = 0; start < array.Length; start += 16)
-                    {
-                        ConsoleWriteLine(ConsoleColor.DarkGreen, ToHexString(array.Slice(start, Math.Min(16, array.Length - start))));
-                    }
-                }
+                // Scan for 10 seconds, then stop automatically
+                await Task.Delay(TimeSpan.FromSeconds(10));
+                watcher.Stop();
+                Console.WriteLine("\nScan complete.");
             }
-
-            if (Section)
+            else
             {
-                foreach (var ds in args.Advertisement.DataSections)
-                {
-                    ConsoleWrite(ConsoleColor.Yellow, "DataType:");
-                    ConsoleWriteLine(Console.ForegroundColor, $" 0x{ds.DataType:X2}");
-                    ConsoleWriteLine(ConsoleColor.Yellow, "Data:");
-                    var array = ds.Data.ToArray().AsSpan();
-                    for (var start = 0; start < array.Length; start += 16)
-                    {
-                        ConsoleWriteLine(ConsoleColor.DarkGreen, ToHexString(array.Slice(start, Math.Min(16, array.Length - start))));
-                    }
-                }
+                // Continuous mode - wait for user to press Enter
+                Console.ReadLine();
+                watcher.Stop();
             }
-        }
-#pragma warning restore CA1031
-
-    watcher.Start();
-
-    if (Once)
-    {
-        // Scan for 10 seconds, then stop automatically
-        await Task.Delay(TimeSpan.FromSeconds(10));
-        watcher.Stop();
-        
-        if (!string.IsNullOrEmpty(Name) && !deviceFound)
-        {
-            ConsoleWriteLine(ConsoleColor.Red, $"Device [{Name}] not found.");
-        }
-        else
-        {
-            Console.WriteLine("\nScan complete.");
-        }
-    }
-    else
-    {
-        // Continuous mode - wait for user to press Enter
-        Console.ReadLine();
-        watcher.Stop();
-    }
         }
         finally
         {
             // Always restore the original console color
             Console.ForegroundColor = originalColor;
         }
-}
+    }
 
     private static void ConsoleWrite(ConsoleColor color, string value)
     {
@@ -332,9 +349,9 @@ public sealed class RootCommandHandler : ICommandHandler
 
     private static async Task<T> RetryAsync<T>(
         Func<Task<T>> op,
-        CancellationToken cancellationToken,
         int attempts,
-        int delayMs)
+        int delayMs,
+        CancellationToken cancellationToken)
     {
         Exception? last = null;
 
